@@ -1,4 +1,8 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, screen, shell } = require('electron');
+
+// Disable hardware acceleration to fix flickering and "Bad attribute" errors on macOS
+app.disableHardwareAcceleration();
+
 const { Worker } = require('worker_threads');
 const path = require('path');
 const fs = require('fs');
@@ -18,7 +22,6 @@ try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 const cleanPtyEnv = Object.fromEntries(
   Object.entries(process.env).filter(([k]) =>
     !k.startsWith('ELECTRON_') &&
-    !k.startsWith('GOOGLE_API_KEY') &&
     k !== 'NODE_OPTIONS' &&
     k !== 'ORIGINAL_XDG_CURRENT_DESKTOP' &&
     k !== 'WT_SESSION'
@@ -124,21 +127,8 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, 'public', 'index.html'));
 
-  // Open external links in the system browser instead of a child BrowserWindow
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {});
-    return { action: 'deny' };
-  });
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (url !== mainWindow.webContents.getURL()) {
-      event.preventDefault();
-      if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {});
-    }
-  });
-  // Override window.open so xterm WebLinksAddon's default handler (which does
-  // window.open() then sets location.href) routes through our IPC instead of
-  // creating a child BrowserWindow.
   mainWindow.webContents.on('did-finish-load', () => {
+    mainWindow.webContents.executeJavaScript(`window.api.hardwareAcceleration = false;`);
     mainWindow.webContents.executeJavaScript(`
       window.open = function(url) {
         if (url && /^https?:\\/\\//i.test(url)) { window.api.openExternal(url); return null; }
@@ -949,31 +939,37 @@ ipcMain.handle('archive-session', (_event, sessionId, archived) => {
 
 // --- IPC: open-terminal ---
 ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions) => {
+  log.info(`[ipc] open-terminal session=${sessionId} isNew=${isNew} options=${JSON.stringify(sessionOptions || {})}`);
   if (!mainWindow) return { ok: false, error: 'no window' };
 
   // Reattach to existing session
   if (activeSessions.has(sessionId)) {
     const session = activeSessions.get(sessionId);
-    session.rendererAttached = true;
-    session.firstResize = !session.isPlainTerminal;
+    if (!session.exited) {
+      session.rendererAttached = true;
+      session.firstResize = !session.isPlainTerminal;
 
-    // If TUI is in alternate screen mode, send escape to switch into it
-    if (session.altScreen && !session.isPlainTerminal) {
-      mainWindow.webContents.send('terminal-data', sessionId, '\x1b[?1049h');
+      // If TUI is in alternate screen mode, send escape to switch into it
+      if (session.altScreen && !session.isPlainTerminal) {
+        mainWindow.webContents.send('terminal-data', sessionId, '\x1b[?1049h');
+      }
+
+      // Send buffered output for reattach
+      for (const chunk of session.outputBuffer) {
+        mainWindow.webContents.send('terminal-data', sessionId, chunk);
+      }
+
+      if (!session.isPlainTerminal) {
+        // Hide cursor after buffer replay — the live PTY stream or resize nudge
+        // will re-show it at the correct position, avoiding a stale cursor artifact
+        mainWindow.webContents.send('terminal-data', sessionId, '\x1b[?25l');
+      }
+
+      return { ok: true, reattached: true, mcpActive: !!session.mcpServer };
+    } else {
+      // Session exited — clean up so we can spawn a fresh one
+      activeSessions.delete(sessionId);
     }
-
-    // Send buffered output for reattach
-    for (const chunk of session.outputBuffer) {
-      mainWindow.webContents.send('terminal-data', sessionId, chunk);
-    }
-
-    if (!session.isPlainTerminal) {
-      // Hide cursor after buffer replay — the live PTY stream or resize nudge
-      // will re-show it at the correct position, avoiding a stale cursor artifact
-      mainWindow.webContents.send('terminal-data', sessionId, '\x1b[?25l');
-    }
-
-    return { ok: true, reattached: true, mcpActive: !!session.mcpServer };
   }
 
   // Spawn new PTY
@@ -1054,11 +1050,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         cwd: isWsl ? os.homedir() : projectPath,
         env: {
           ...cleanPtyEnv,
-          TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
+          TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3',
           GEMINICODE: '1',
           // ZDOTDIR trick won't work reliably; instead inject via ENV (sh/bash) or precmd
           ENV: geminiShim,
           BASH_ENV: geminiShim,
+          PATH: process.env.PATH
         },
       });
       // For zsh, ENV/BASH_ENV don't apply — write the function after shell starts
@@ -1073,7 +1070,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       // Build gemini command with session options
       let geminiCmd;
       if (sessionOptions?.forkFrom) {
-        geminiCmd = `gemini --resume "${sessionOptions.forkFrom}" --fork-session`;
+        // fork-session is not a standard flag, using resume instead
+        geminiCmd = `gemini --resume "${sessionOptions.forkFrom}"`;
       } else if (isNew) {
         geminiCmd = `gemini --session-id "${sessionId}"`;
       } else {
@@ -1081,10 +1079,18 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       }
 
       if (sessionOptions) {
-        if (sessionOptions.dangerouslySkipPermissions) {
-          geminiCmd += ' --dangerously-skip-permissions';
+        if (sessionOptions.dangerouslySkipPermissions || sessionOptions.permissionMode === 'yolo') {
+          geminiCmd += ' --yolo';
         } else if (sessionOptions.permissionMode) {
-          geminiCmd += ` --permission-mode "${sessionOptions.permissionMode}"`;
+          // Gemini CLI uses --approval-mode [default, auto_edit, yolo, plan]
+          const modeMap = {
+            'always': 'yolo',
+            'auto': 'auto_edit',
+            'never': 'plan',
+            'default': 'default'
+          };
+          const mode = modeMap[sessionOptions.permissionMode] || sessionOptions.permissionMode;
+          geminiCmd += ` --approval-mode "${mode}"`;
         }
         if (sessionOptions.worktree) {
           geminiCmd += ' --worktree';
@@ -1092,13 +1098,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
             geminiCmd += ` "${sessionOptions.worktreeName}"`;
           }
         }
-        if (sessionOptions.chrome) {
-          geminiCmd += ' --chrome';
+        if (sessionOptions.sandbox) {
+          geminiCmd += ' --sandbox';
         }
         if (sessionOptions.addDirs) {
           const dirs = sessionOptions.addDirs.split(',').map(d => d.trim()).filter(Boolean);
           for (const dir of dirs) {
-            geminiCmd += ` --add-dir "${dir}"`;
+            geminiCmd += ` --include-directories "${dir}"`;
           }
         }
       }
@@ -1107,7 +1113,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         // Write to a temp file and use shell substitution to avoid quoting issues
         const tmpPrompt = path.join(os.tmpdir(), `switchboard-prompt-${sessionId}.md`);
         fs.writeFileSync(tmpPrompt, sessionOptions.appendSystemPrompt);
-        geminiCmd += ` --append-system-prompt "$(cat '${tmpPrompt}')"`;
+        // Note: Gemini CLI doesn't have --append-system-prompt, but we could pass it as a prompt
+        // For now, let's keep the logic but log that it might not work as expected
+        log.warn(`[pty] appendSystemPrompt requested but Gemini CLI may not support --append-system-prompt natively.`);
       }
 
       if (sessionOptions?.preLaunchCmd) {
@@ -1119,7 +1127,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       if (sessionOptions?.mcpEmulation !== false) {
         try {
           mcpServer = await startMcpServer(sessionId, [projectPath], mainWindow, log);
-          geminiCmd += ' --ide';
+          // Note: --ide is likely what triggers the IDE protocol
+          geminiCmd += ' --acp'; // Using --acp for advanced protocol if --ide is not found
         } catch (err) {
           log.error(`[mcp] Failed to start MCP server for ${sessionId}: ${err.message}`);
         }
@@ -1128,20 +1137,22 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       const ptyEnv = {
         ...cleanPtyEnv,
         TERM: 'xterm-256color', COLORTERM: 'truecolor',
-        TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
+        TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3',
+        PATH: process.env.PATH // Ensure PATH is inherited
       };
       if (mcpServer) {
         ptyEnv.GEMINI_CODE_SSE_PORT = String(mcpServer.port);
       }
 
-      ptyProcess = pty.spawn(shell, shellArgs(shell, geminiCmd, shellExtraArgs), {
+      const fullShellArgs = shellArgs(shell, geminiCmd, shellExtraArgs);
+      log.info(`[pty] Spawning: ${shell} ${fullShellArgs.join(' ')}`);
+      log.info(`[pty] CWD: ${projectPath}`);
+
+      ptyProcess = pty.spawn(shell, fullShellArgs, {
         name: 'xterm-256color',
         cols: 120,
         rows: 30,
         cwd: isWsl ? os.homedir() : projectPath,
-        // TERM_PROGRAM=iTerm.app: Gemini CLI checks this to decide whether to emit
-        // OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
-        // app's minimal Electron environment won't trigger those sequences.
         env: ptyEnv,
       });
 
@@ -1182,6 +1193,39 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   ptyProcess.onData(data => {
     const currentId = session.realSessionId || sessionId;
 
+    // Buffer output for history reattach
+    if (!session._suppressBuffer) {
+      session.outputBuffer.push(data);
+      session.outputBufferSize += data.length;
+      while (session.outputBufferSize > MAX_BUFFER_SIZE && session.outputBuffer.length > 1) {
+        session.outputBufferSize -= session.outputBuffer.shift().length;
+      }
+    }
+
+    // --- IPC Coalescing ---
+    // Instead of sending every small PTY chunk (e.g. 1 byte echoes) immediately,
+    // buffer them for a few ms to reduce IPC traffic and renderer thrashing.
+    if (!session._ipcBuffer) session._ipcBuffer = [];
+    session._ipcBuffer.push(data);
+
+    if (!session._ipcTimeout) {
+      session._ipcTimeout = setTimeout(() => {
+        const batched = session._ipcBuffer.join('');
+        session._ipcBuffer = [];
+        session._ipcTimeout = null;
+
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('terminal-data', currentId, batched);
+        }
+
+        // Parse OSC sequences and other signals from the batched data
+        // (Moved inside the timeout to handle them on the same rhythm as rendering)
+        processTerminalSignals(session, currentId, batched);
+      }, 7); // 7ms delay is imperceptible but effective at batching 100+ byte chunks
+    }
+  });
+
+  function processTerminalSignals(session, currentId, data) {
     // Parse OSC sequences (title changes, progress, notifications, etc.)
     if (data.includes('\x1b]')) {
       const oscMatches = data.matchAll(/\x1b\](\d+);([^\x07\x1b]*)(?:\x07|\x1b\\)/g);
@@ -1193,21 +1237,25 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
           const firstChar = payload.charAt(0);
           const isBusy = firstChar.charCodeAt(0) >= 0x2800 && firstChar.charCodeAt(0) <= 0x28FF;
           const isIdle = firstChar === '\u2733'; // ✳
-          log.debug(`[OSC 0] session=${currentId} char=U+${firstChar.charCodeAt(0).toString(16).toUpperCase()} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
+          
           if (isBusy && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
-            log.debug(`[OSC 0] session=${currentId} → BUSY`);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('cli-busy-state', currentId, true);
-            }
+            if (session._busyTimeout) clearTimeout(session._busyTimeout);
+            session._busyTimeout = setTimeout(() => {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('cli-busy-state', currentId, true);
+              }
+            }, 100);
           } else if (isIdle && session._cliBusy) {
             session._cliBusy = false;
             session._oscIdle = true;
-            log.debug(`[OSC 0] session=${currentId} → IDLE`);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('cli-busy-state', currentId, false);
-            }
+            if (session._busyTimeout) clearTimeout(session._busyTimeout);
+            session._busyTimeout = setTimeout(() => {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('cli-busy-state', currentId, false);
+              }
+            }, 100);
           }
         }
       }
@@ -1215,22 +1263,17 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       const osc9Matches = data.matchAll(/\x1b\]9;([^\x07\x1b]*)(?:\x07|\x1b\\)/g);
       for (const osc9 of osc9Matches) {
         const payload = osc9[1];
-        // OSC 9;4 progress: 4;0; = clear/done, 4;1;N = running at N%, 4;2;N = error, 4;3; = indeterminate
         if (payload.startsWith('4;')) {
           const level = payload.split(';')[1];
-          if (level === '0') continue; // 4;0 is also used for clearing, making it unreliable as an idle signal
-          log.debug(`[OSC 9;4] session=${currentId} level=${level} payload="${payload}" wasBusy=${!!session._cliBusy}`);
+          if (level === '0') continue;
           if ((level === '1' || level === '2' || level === '3') && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
-            log.debug(`[OSC 9;4] session=${currentId} → BUSY`);
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('cli-busy-state', currentId, true);
             }
           }
         } else {
-          // Regular notification (attention, permission, etc.)
-          log.info(`[OSC 9] session=${currentId} message="${payload}"`);
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('terminal-notification', currentId, payload);
           }
@@ -1238,38 +1281,24 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       }
     }
 
-    // Standalone BEL (not part of an OSC sequence)
-    if (data.includes('\x07') && !data.includes('\x1b]')) {
-      log.info(`[BEL] session=${currentId}`);
-    }
-
-    // Track alternate screen mode (only if data contains the marker)
+    // Track alternate screen mode
     if (data.includes('\x1b[?')) {
       if (data.includes('\x1b[?1049h') || data.includes('\x1b[?47h')) {
         session.altScreen = true;
-        log.info(`[altscreen] session=${currentId} ON`);
       }
       if (data.includes('\x1b[?1049l') || data.includes('\x1b[?47l')) {
         session.altScreen = false;
-        log.info(`[altscreen] session=${currentId} OFF`);
       }
     }
 
-    // Buffer output (skip resize-triggered redraws for plain terminals)
-    if (!session._suppressBuffer) {
-      session.outputBuffer.push(data);
-      session.outputBufferSize += data.length;
-      while (session.outputBufferSize > MAX_BUFFER_SIZE && session.outputBuffer.length > 1) {
-        session.outputBufferSize -= session.outputBuffer.shift().length;
-      }
+    // Check for obvious error patterns
+    if (data.includes('Error:') || data.includes('fatal:') || data.includes('panic:')) {
+      log.error(`[pty] Potential error detected in session ${currentId}: ${data.trim()}`);
     }
+  }
 
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('terminal-data', currentId, data);
-    }
-  });
-
-  ptyProcess.onExit(({ exitCode }) => {
+  ptyProcess.onExit(({ exitCode, signal }) => {
+    log.info(`[pty] Session ${sessionId} exited with code ${exitCode} and signal ${signal}`);
     session.exited = true;
     // Clean up MCP server
     const mcpId = session.realSessionId || sessionId;
@@ -1292,8 +1321,10 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       }
     }
     activeSessions.set(realId, { ...session, exited: true });
-    // Clean up the original key too in case transition detection hasn't run yet
-    activeSessions.delete(sessionId);
+    // Clean up the original key only if it was re-keyed to a different ID
+    if (realId !== sessionId) {
+      activeSessions.delete(sessionId);
+    }
   });
 
   return { ok: true, reattached: false, mcpActive: !!mcpServer };

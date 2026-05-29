@@ -70,6 +70,7 @@ contextBridge.exposeInMainWorld('api', {
   onStatusUpdate: (callback) => {
     ipcRenderer.on('status-update', (_event, text, type) => callback(text, type));
   },
+  hardwareAcceleration: true, // Default to true, main.js will override if disabled
 
   // File drag-and-drop
   getPathForFile: (file) => webUtils.getPathForFile(file),
